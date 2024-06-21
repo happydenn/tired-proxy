@@ -8,16 +8,41 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
+
+type Counter struct {
+	count int
+	sync.Mutex
+}
+
+func (c *Counter) Increment() {
+	c.Lock()
+	defer c.Unlock()
+	c.count++
+	log.Infof("Active requests: %d", c.count)
+}
+
+func (c *Counter) Decrement(resetFn func()) {
+	c.Lock()
+	defer c.Unlock()
+	c.count--
+	log.Infof("Active requests: %d", c.count)
+
+	if c.count == 0 {
+		resetFn()
+	}
+}
 
 type IdleProxy struct {
 	idleTime   time.Duration
 	timer      *time.Timer
 	server     *http.Server
 	proxy      *httputil.ReverseProxy
+	counter    *Counter
 	chanFinish chan error
 }
 
@@ -29,6 +54,7 @@ func StartIdleProxy(ctx context.Context, originUrl *url.URL, port string, idleTi
 		timer:      time.NewTimer(idleTime),
 		server:     &http.Server{Addr: fmt.Sprintf(":%s", port), ErrorLog: stdlog.New(httpErrorLogWriter, "", 0)},
 		proxy:      httputil.NewSingleHostReverseProxy(originUrl),
+		counter:    &Counter{},
 		chanFinish: make(chan error, 1),
 	}
 
@@ -68,7 +94,13 @@ func StartIdleProxy(ctx context.Context, originUrl *url.URL, port string, idleTi
 
 // Proxy request handler that also resets the idle timer
 func (p *IdleProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.timer.Reset(p.idleTime)
+	p.timer.Stop()
+	p.counter.Increment()
+
+	defer p.counter.Decrement(func() {
+		p.timer.Reset(p.idleTime)
+	})
+
 	log.Infof("%s %s", r.Method, r.URL)
 	p.proxy.ServeHTTP(w, r)
 }
